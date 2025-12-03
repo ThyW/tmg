@@ -7,27 +7,27 @@
  */
 
 //Regular text
-#define BLK "\e[0;30m"
-#define RED "\e[0;31m"
-#define GRN "\e[0;32m"
-#define YEL "\e[0;33m"
-#define BLU "\e[0;34m"
-#define MAG "\e[0;35m"
-#define CYN "\e[0;36m"
-#define WHT "\e[0;37m"
+#define BLK "\033[0;30m"
+#define RED "\033[0;31m"
+#define GRN "\033[0;32m"
+#define YEL "\033[0;33m"
+#define BLU "\033[0;34m"
+#define MAG "\033[0;35m"
+#define CYN "\033[0;36m"
+#define WHT "\033[0;37m"
 
 //Regular bold text
-#define BBLK "\e[1;30m"
-#define BRED "\e[1;31m"
-#define BGRN "\e[1;32m"
-#define BYEL "\e[1;33m"
-#define BBLU "\e[1;34m"
-#define BMAG "\e[1;35m"
-#define BCYN "\e[1;36m"
-#define BWHT "\e[1;37m"
+#define BBLK "\033[1;30m"
+#define BRED "\033[1;31m"
+#define BGRN "\033[1;32m"
+#define BYEL "\033[1;33m"
+#define BBLU "\033[1;34m"
+#define BMAG "\033[1;35m"
+#define BCYN "\033[1;36m"
+#define BWHT "\033[1;37m"
 
 //Reset
-#define reset "\e[0m"
+#define reset "\033[0m"
 
 #define TRACE MAG "[TRACE]" reset
 #define INFO CYN "[INFO]" reset

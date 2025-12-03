@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -pedantic -lpthread
+CFLAGS = -Wall -Wextra -pedantic -lpthread
 OUT = tmg
 
 SOURCE = tmg.c
