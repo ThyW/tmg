@@ -4,3 +4,5 @@
 !Makefile
 !.gitignore
 !*.md
+!misc
+!misc/**

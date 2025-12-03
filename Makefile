@@ -2,7 +2,9 @@ CC = gcc
 CFLAGS = -Wall -Wextra -pedantic -lpthread
 OUT = tmg
 
-SOURCE = tmg.c
+prefix ?= ~/.local
+
+SOURCE = tmg.c color.h
 
 ifdef DEBUG
 	CFLAGS += -g -DDEBUG
@@ -15,8 +17,9 @@ all: $(OUT)
 $(OUT): $(SOURCE)
 	$(CC) $(CFLAGS) -o tmg $(SOURCE)
 
+install: all
+	cp -p $(OUT) $(prefix)/bin
 clean:
 	rm -f $(OUT)
-
 
 .PHONY: clean

@@ -1,0 +1,13 @@
+[Unit]
+Description=timer manager daemon (user service)
+
+[Service]
+Type=simple
+# edit the following three lines accordingly:
+Environment=PATH=${PATH}:%h/.local/bin
+ExecStart=tmg -D
+ExecStop=tmg -q
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
