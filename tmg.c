@@ -316,6 +316,7 @@ int init_manager(tmg_manager_t *mgr)
     len = strlen(mgr->sock_path);
     strncpy(addr.sun_path, mgr->sock_path, len);
 
+    (void) unlink(mgr->sock_path);
     res = bind(mgr->sockfd, (struct sockaddr *) &addr, sizeof(struct sockaddr_un));
     if (res == -1) {
         perror("tgm");
