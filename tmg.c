@@ -88,8 +88,8 @@ char *arg_sock_path = NULL;
 /// Print help message to standard output.
 void help()
 {
-    printf("usage: tmg [-D] [-H HOURS] [-m MINUTES] [-s SECONDS] [-M message] [-S SOCKET_PATH] [-p PROGRAM]\n");
-    printf("           [-l] [-d ID] [-c ID] [-b BACKLOG]\n\n");
+    printf("usage: tmg [-D] [-H HOURS] [-m MINUTES] [-s SECONDS] [-R COMMAND]\n");
+    printf("           [-l] [-d ID] [-c ID] [-b BACKLOG] [-S SOCKET_PATH]\n\n");
     printf("timer manager: create & manage timed commands\n\n");
     printf("options:\n");
     printf("  -h\t\tdisplay this help message\n");
@@ -97,7 +97,7 @@ void help()
     printf("  -H <num>\tset number of hours when creating/changing a timer\n");
     printf("  -m <num>\tset number of minutes when creating/changing a timer\n");
     printf("  -s <num>\tset number of seconds when creating/changing a timer\n");
-    printf("  -R <str>\tcommand to run once timer finishes\n");
+    printf("  -R <str>\tcommand to run once timer finishes (<shell> -c <cmd>)\n");
     printf("  -S <str>\tpath to daemon socket\n");
     printf("  -d <num>\tdelete timer by id\n");
     printf("  -c <num>\tchange timer by id\n");
@@ -177,7 +177,6 @@ int timer_cmp(const void *a, const void *b)
 /// 3. the default path is `$XDG_RUNTIME_DIR/tmg.socket`
 char *socket_path()
 {
-    size_t len;
     char *ptr = NULL;
     char *env_val = NULL;
 
@@ -188,8 +187,7 @@ char *socket_path()
     } else {
         env_val = getenv("XDG_RUNTIME_DIR");
         if (env_val != NULL) {
-            len = strlen(env_val);
-            ptr = malloc(len + strlen(DEFAULT_SOCKET_PATH)); // |env_val| + |DEFAULT_SOCKET_PATH| + '/' + '\0'
+            ptr = malloc(strlen(env_val) + strlen(DEFAULT_SOCKET_PATH) + 2); // |env_val| + |DEFAULT_SOCKET_PATH| + '/' + '\0'
             if (ptr != NULL) {
                 sprintf(ptr, "%s/%s", env_val, DEFAULT_SOCKET_PATH);
             }
@@ -623,8 +621,7 @@ int client_main()
 /// Main function of the daemon.
 int daemon_main()
 {
-    int res;
-    int conn;
+    int res, conn, backlog;
     ssize_t rb;
     // Buffer for client messages
     // Replies are handled in
@@ -636,14 +633,15 @@ int daemon_main()
         return res;
     }
 
-    res = listen(mgr.sockfd, arg_backlog ? arg_backlog : DEFAULT_SOCKET_BACKLOG);
+    backlog = (arg_backlog > 0) ? arg_backlog : DEFAULT_SOCKET_BACKLOG;
+    res = listen(mgr.sockfd, backlog);
     if (res == -1) {
         perror("tgm");
         free_manager(&mgr);
         return -1;
     }
 
-    LOG("%s: listening for connections\n", INFO);
+    LOG("%s: listening for connections on socket '%s' with backlog '%d'\n", INFO, mgr.sock_path, backlog);
 
     while ((conn = accept(mgr.sockfd, NULL, NULL)) != -1) {
         LOG("%s: client connecected\n", INFO);
