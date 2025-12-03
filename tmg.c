@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "color.h"
+
+#include <asm-generic/errno-base.h>
 #include <getopt.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -24,10 +27,19 @@
 #define OP_LIST 3
 #define OP_QUIT 4
 
-#define MAX(a, b) (a >= b ? a : b)
-#define MIN(a, b) (a <= b ? a : b)
-
 #define N_OPS 5
+
+/// Log a message to standard error.
+#define LOG(...) dprintf(2, __VA_ARGS__);
+/// Send a reply to a client on connection `conn`.
+#define REPLY(conn, ...) dprintf(conn, __VA_ARGS__);
+/// Macro for logging and error and exiting the process.
+#define UNRECOVERABLE(res, msg, action) \
+    res = action;                       \
+    if (res) {                          \
+        perror(msg);                    \
+        exit(1);                        \
+    }
 
 #ifdef DEBUG
 #define DEBUGMSG(m) printf("{\n\tsecs: %d\n" \
@@ -144,7 +156,7 @@ typedef struct
     char body[MAXSIZE * 2];
 } tmg_reply_t;
 
-int make_timer_thread(tmg_manager_t *mgr);
+int create_thread(tmg_manager_t *mgr);
 
 int timer_cmp(const void *a, const void *b)
 {
@@ -156,14 +168,18 @@ int timer_cmp(const void *a, const void *b)
 
 int enq(tmg_manager_t *mgr, tmg_timer_t *timer)
 {
-    pthread_mutex_lock(&mgr->mutex);
     int last_id, new_last_id;
     tmg_timer_t *new;
+    int res;
+    bool restart_thread = false;
+
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex lock", pthread_mutex_lock(&mgr->mutex));
     last_id = (mgr->q.len != 0) ? mgr->q.timers[mgr->q.len - 1].id : -1;
     if (mgr->q.cap == mgr->q.len) {
         new = realloc(mgr->q.timers, sizeof(tmg_timer_t) * mgr->q.cap * 2);
         if (new == NULL) {
-            perror("tmg: enqueue timer");
+            pthread_mutex_unlock(&mgr->mutex);
+            perror("realloc");
             return -1;
         }
         mgr->q.timers = new;
@@ -173,121 +189,121 @@ int enq(tmg_manager_t *mgr, tmg_timer_t *timer)
     memcpy(&mgr->q.timers[mgr->q.len++], timer, sizeof(tmg_timer_t));
     qsort(mgr->q.timers, mgr->q.len, sizeof(tmg_timer_t), timer_cmp);
     new_last_id = mgr->q.timers[mgr->q.len - 1].id;
-    if (new_last_id != last_id && last_id != -1) {
-        pthread_cancel(mgr->timer_thread);
-        pthread_mutex_unlock(&mgr->mutex);
-        make_timer_thread(mgr);
-    } else if (new_last_id != last_id) {
-        pthread_mutex_unlock(&mgr->mutex);
-        make_timer_thread(mgr);
-    } else {
-        pthread_mutex_unlock(&mgr->mutex);
+    restart_thread = new_last_id != last_id;
+    if (restart_thread && last_id != -1) {
+        pthread_cancel(mgr->timer_thread); // SAFETY: fails only if the thread is dead already, but no harm either way.
     }
+    UNRECOVERABLE(res, "unrecoverable: someone stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+    if (restart_thread)
+        return create_thread(mgr);
 
     return 0;
 }
 
 int deq(tmg_manager_t *mgr)
 {
-    pthread_mutex_lock(&mgr->mutex);
+    int res;
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex lock", pthread_mutex_lock(&mgr->mutex));
     if (mgr->q.len <= 0) {
+        pthread_mutex_unlock(&mgr->mutex);
         return 0;
     }
 
     --(mgr->q.len);
-    pthread_mutex_unlock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: someone stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+
     return 0;
 }
 
 /// This function runs in the timer thread.
-void *run_timer_thread(void *args)
+void *thread_routine(void *args)
 {
     tmg_manager_t *mgr = (tmg_manager_t *) args;
     tmg_timer_t timer = { 0 };
     int res;
-    size_t msg_len;
-    size_t prog_len;
+    size_t msg_len, prog_len;
     time_t secs, curr_time;
     char *cmdbuf;
     char *prog;
 
-    // Disable cancellation, take the manager mutex and copy necessary stuff
+    // Should be able to be canceled at any time (when the cancellation is *ENABLED*).
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    // Disable cancellation, take the manager mutex and copy necessary stuff.
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-    pthread_mutex_lock(&mgr->mutex);
+    pthread_mutex_lock(&mgr->mutex); // SAFETY: it is okay to wait for mutex lock, because the thread should always be canceled before creating a new one.
     curr_time = time(NULL);
     prog = strdup(mgr->program);
     memcpy(&timer, &mgr->q.timers[mgr->q.len - 1], sizeof(tmg_timer_t));
+    LOG("%s new thread for timer with id '%d' created\n", TRACE, timer.id);
     secs = timer.end - curr_time;
     DEBUGPRINT("new timer thread for timer: ");
     DEBUGTIMER(timer);
-    // register handler
+    // register cleanup handler
     pthread_cleanup_push((void (*)(void *)) free, prog);
-    pthread_mutex_unlock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: someone stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
-    if (secs < 0) {
-        dprintf(2, "timer is past it's due, cancelling\n");
-        pthread_exit(NULL);
+    if (secs > 0) {
+        // The thread sleeps for the number of seconds needed to finish the timer.
+        sleep(secs);
+    } else {
+        // If the timer is finished, we skip the sleeping, log the discrepancy and schedule the next timer.
+        LOG("%s timer id: %d is delayed by %ld seconds\n", WARN, timer.id, -secs);
     }
 
-    sleep(secs);
-
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     msg_len = strlen(timer.arg);
     prog_len = strlen(prog);
-    // register another handler
+    // Disable cancellation for allocation and cleaning in order to prevent memory leaks.
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     cmdbuf = malloc(msg_len + prog_len + 2);
     pthread_cleanup_push((void (*)(void *)) free, cmdbuf);
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+
     sprintf(cmdbuf, "%s %s", prog, timer.arg);
 
     res = system(cmdbuf);
     if (res != 0) {
         perror("tmg");
     }
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
-    // Cleanup
+    // Do the actual cleanup, free both allocated strings, we won't need them anymore.
     pthread_cleanup_pop(true);
     pthread_cleanup_pop(true);
 
+    // Disable cancellation and try to schedule the next thread.
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-    res = pthread_mutex_trylock(&mgr->mutex);
-    if (res) {
-        pthread_exit(NULL);
-    }
+    pthread_mutex_lock(&mgr->mutex);
+    // Dequeue the finished timer.
     deq(mgr);
+    // If there are no more timers, cancel the thread and wait.
     if (mgr->q.len <= 0) {
         pthread_mutex_unlock(&mgr->mutex);
         pthread_exit(NULL);
     }
-    make_timer_thread(mgr);
-    pthread_mutex_unlock(&mgr->mutex);
+    // Because we use a **RECURSIVE** mutex, we can keep the mutex locked even though `create_thread()` also locks the mutex.
+    create_thread(mgr); // SAFETY: return value not checked, because if this fails, the entire process exits.
+    // Unlock and exit the thread.
+    UNRECOVERABLE(res, "unrecoverable: someone stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
     pthread_exit(NULL);
 }
 
-int make_timer_thread(tmg_manager_t *mgr)
+int create_thread(tmg_manager_t *mgr)
 {
-    pthread_mutex_lock(&mgr->mutex);
     pthread_t thread;
     int res;
 
-    res = pthread_create(&thread, NULL, run_timer_thread, mgr);
-    if (res == -1) {
-        perror("tmg");
-        pthread_mutex_unlock(&mgr->mutex);
-        return -1;
-    }
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex lock", pthread_mutex_lock(&mgr->mutex));
+    UNRECOVERABLE(res, "unrecoverable: could not create timer thread", pthread_create(&thread, NULL, thread_routine, mgr));
     pthread_detach(thread);
     mgr->timer_thread = thread;
-    pthread_mutex_unlock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
 
     return 0;
 }
 
 int init_manager(tmg_manager_t *mgr)
 {
-    int res, len;
+    int res;
     struct sockaddr_un addr;
     pthread_mutexattr_t attrs;
 
@@ -310,8 +326,7 @@ int init_manager(tmg_manager_t *mgr)
 
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
-    len = strlen(mgr->sock_path);
-    strncpy(addr.sun_path, mgr->sock_path, MIN(len, sizeof(addr.sun_path) - 1));
+    strncpy(addr.sun_path, mgr->sock_path, sizeof(addr.sun_path) - 1);
 
     (void) unlink(mgr->sock_path);
     res = bind(mgr->sockfd, (struct sockaddr *) &addr, sizeof(struct sockaddr_un));
@@ -344,6 +359,8 @@ int create_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 {
     tmg_timer_t timer = { 0 };
     int res;
+
+    LOG("%s creating timer\n", INFO)
     timer.id = ++(mgr->current);
     timer.begin = time(NULL);
     timer.end = timer.begin + msg->secs + msg->minutes * 60 + msg->hours * 60 * 60;
@@ -351,22 +368,25 @@ int create_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 
     res = enq(mgr, &timer);
     if (res) {
-        dprintf(conn, "timer creation failed.\n");
+        REPLY(conn, "%s timer creation failed.\n", NOK);
         return -1;
     }
-    dprintf(conn, "timer created successfully.\n");
+    REPLY(conn, "%s timer created successfully.\n", OK);
     return 0;
 }
 
 int change_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 {
     tmg_timer_t *timer;
-    bool restart_thread = false;
+    bool restart_thread, found = false;
     int last_id;
+    int res;
+    LOG("%s changing timer with id '%d'\n", INFO, msg->id);
 
-    pthread_mutex_lock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex", pthread_mutex_lock(&mgr->mutex));
     if (mgr->q.len <= 0) {
-        dprintf(conn, "no timers found.\n");
+        REPLY(conn, "%s no timers found.\n", OK);
+        UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
         return 0;
     }
     last_id = mgr->q.timers[mgr->q.len - 1].id;
@@ -374,7 +394,8 @@ int change_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
         if (mgr->q.timers[i].id != msg->id) {
             continue;
         }
-
+        found = true;
+        // SAFETY: no real errors are returned on thread cancellation.
         pthread_cancel(mgr->timer_thread);
         timer = &mgr->q.timers[i];
         timer->end = timer->begin + msg->secs + msg->minutes * 60 + msg->hours * 60 * 60;
@@ -385,20 +406,29 @@ int change_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
         }
         break;
     }
-    pthread_mutex_unlock(&mgr->mutex);
+    if (!found) {
+        REPLY(conn, "%s no timers matching id '%d' found.\n", OK, msg->id);
+        UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+        return 0;
+    }
     if (restart_thread)
-        make_timer_thread(mgr);
+        create_thread(mgr); // SAFETY: this fails, process exits.
+    UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
 
+    REPLY(conn, "%s timer with id '%d' changed successfully.\n", OK, msg->id);
     return 0;
 }
 
 int delete_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 {
     tmg_timer_t a, tmp = { 0 };
-    bool restart_thread = false;
+    int res;
+    bool restart_thread, found = false;
+    LOG("%s deleting timer with id '%d'\n", INFO, msg->id);
 
-    pthread_mutex_lock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex", pthread_mutex_lock(&mgr->mutex));
     if (mgr->q.len <= 0) {
+        REPLY(conn, "%s no timers found.\n", NOK);
         return 0;
     }
     if ((restart_thread = msg->id == mgr->q.timers[mgr->q.len - 1].id)) {
@@ -411,48 +441,58 @@ int delete_timer(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
             memcpy(&tmp, &mgr->q.timers[mgr->q.len - 1], sizeof(tmg_timer_t));
             memcpy(&mgr->q.timers[mgr->q.len - 1], &a, sizeof(tmg_timer_t));
             deq(mgr);
+            found = true;
             break;
         }
     }
+    if (!found) {
+        UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+        REPLY(conn, "%s no timers matching id '%d' found.\n", OK, msg->id);
+        return 0;
+    }
     qsort(mgr->q.timers, mgr->q.len, sizeof(tmg_timer_t), timer_cmp);
-    pthread_mutex_unlock(&mgr->mutex);
-
     if (restart_thread)
-        make_timer_thread(mgr);
+        create_thread(mgr); // SAFETY: this fails, process exits.
+    UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+    REPLY(conn, "%s deleted timer with id '%d'\n", OK, msg->id);
 
     return 0;
 }
 int list_timers(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 {
+    int res;
     tmg_timer_t timer;
     struct tm *lt;
     char begin_buf[64];
     char end_buf[64];
-    tmg_reply_t reply = { 0 };
+    LOG("%s listing timers\n", INFO)
 
-    pthread_mutex_lock(&mgr->mutex);
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex", pthread_mutex_lock(&mgr->mutex));
+    REPLY(conn, "%s listing timers:\n", OK);
+    REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
+    REPLY(conn, "| %10s | %25s | %25s | %30s |\n", "ID", "BEGIN TIME", "END TIME", "ARGUMENT");
     for (int i = 0; i < mgr->q.len; i++) {
         timer = mgr->q.timers[(mgr->q.len - 1) - i];
         lt = localtime(&timer.begin);
         strftime(begin_buf, sizeof(begin_buf), "%a %b %e %H:%M:%S %Y", lt);
         lt = localtime(&timer.end);
         strftime(end_buf, sizeof(end_buf), "%a %b %e %H:%M:%S %Y", lt);
-        sprintf(reply.body, "[id: %d; begin: %s; end: %s; argument: {%s}]\n", timer.id, begin_buf, end_buf, timer.arg);
-        write(conn, &reply, sizeof(reply));
+        REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
+        REPLY(conn, "| %10d | %25s | %25s | %30s |\n", timer.id, begin_buf, end_buf, timer.arg);
     }
-    pthread_mutex_unlock(&mgr->mutex);
+    REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
+    UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
     return 0;
 }
 
-int quit_handler(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
+int quit_daemon(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
 {
-    pthread_mutex_lock(&mgr->mutex);
+    int res;
+    UNRECOVERABLE(res, "unrecoverable: could not acquire mutex", pthread_mutex_lock(&mgr->mutex));
     pthread_cancel(mgr->timer_thread);
-    tmg_reply_t reply = { 0 };
 
-    sprintf(reply.body, "quit request recieved\n");
-    write(conn, &reply, sizeof(reply));
-    pthread_mutex_unlock(&mgr->mutex);
+    REPLY(conn, "%s quit request recieved\n", OK);
+    UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
     return 0;
 }
 
@@ -461,7 +501,7 @@ static int (*handlers[N_OPS])(tmg_manager_t *, const tmg_client_message_t *, int
     change_timer,
     delete_timer,
     list_timers,
-    quit_handler,
+    quit_daemon,
 };
 
 int client_main()
@@ -550,13 +590,13 @@ int daemon_main()
         return -1;
     }
 
-    dprintf(2, "listening for connections\n");
+    LOG("%s: listening for connections\n", INFO);
 
     while ((conn = accept(mgr.sockfd, NULL, NULL)) != -1) {
-        dprintf(2, "conn: established\n");
+        LOG("%s: client connecected\n", INFO);
         rb = read(conn, &msg, sizeof(msg));
         if (rb != sizeof(msg)) {
-            dprintf(2, "malformed message recieved, closing connection\n");
+            LOG("%s: malformed message recieved, closing connection\n", ERR);
             close(conn);
             memset(&msg, 0, sizeof(tmg_client_message_t));
             continue;
@@ -573,7 +613,7 @@ int daemon_main()
 
         memset(&msg, 0, sizeof(tmg_client_message_t));
         close(conn);
-        dprintf(2, "conn: closed\n");
+        LOG("%s: client disconnected\n", INFO);
     }
 
     free_manager(&mgr);
