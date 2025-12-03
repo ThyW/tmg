@@ -18,6 +18,7 @@
 #define DEFAULT_SOCKET_BACKLOG 32
 #define DEFAULT_PROGRAM "notify-send"
 #define DEFAULT_PQ_CAPACITY 32
+#define DEFAULT_ENV_VAR "TMG_SOCKET"
 
 #define MAXSIZE 1024
 
@@ -58,7 +59,7 @@
 #define DEBUGARGS()                                                                                                                                           \
     printf("daemon = %d; list = %d\n", arg_daemon, arg_list);                                                                                                 \
     printf("secs = %d, mins = %d, hours = %d, change = %d, delete = %d, backlog = %d\n", arg_secs, arg_mins, arg_hours, arg_change, arg_delete, arg_backlog); \
-    printf("socket_path = '%s', prog = '%s', message = '%s'\n", arg_sock_path, arg_prog, arg_msg);
+    printf("socket_path = '%s', calling = '%s'\n", arg_sock_path, arg_run);
 
 #define DEBUGTIMER(t) printf("{\n\tid: %d\n"  \
                              "\tbegin: %ld\n" \
@@ -81,8 +82,7 @@
 // command line options
 bool arg_daemon, arg_list, arg_quit = false;
 int arg_change, arg_delete, arg_secs, arg_hours, arg_mins, arg_backlog = 0;
-char *arg_msg = NULL;
-char *arg_prog = NULL;
+char *arg_run = NULL;
 char *arg_sock_path = NULL;
 
 /// Print help message to standard output.
@@ -90,16 +90,15 @@ void help()
 {
     printf("usage: tmg [-D] [-H HOURS] [-m MINUTES] [-s SECONDS] [-M message] [-S SOCKET_PATH] [-p PROGRAM]\n");
     printf("           [-l] [-d ID] [-c ID] [-b BACKLOG]\n\n");
-    printf("timer manager: create & manage timers\n\n");
+    printf("timer manager: create & manage timed commands\n\n");
     printf("options:\n");
     printf("  -h\t\tdisplay this help message\n");
     printf("  -l\t\tlist active timers\n");
     printf("  -H <num>\tset number of hours when creating/changing a timer\n");
     printf("  -m <num>\tset number of minutes when creating/changing a timer\n");
     printf("  -s <num>\tset number of seconds when creating/changing a timer\n");
-    printf("  -M <str>\tset timer argument\n");
+    printf("  -R <str>\tcommand to run once timer finishes\n");
     printf("  -S <str>\tpath to daemon socket\n");
-    printf("  -p <str>\tprogram to use when running timer actions\n");
     printf("  -d <num>\tdelete timer by id\n");
     printf("  -c <num>\tchange timer by id\n");
     printf("  -b <num>\tbacklog of socket connections\n");
@@ -129,8 +128,6 @@ typedef struct
     int sockfd;
     // socket path
     char *sock_path;
-    // Program to be run after the timer finishes
-    char *program;
     // timer thread id
     pthread_t timer_thread;
     // manager mutex
@@ -170,6 +167,36 @@ int timer_cmp(const void *a, const void *b)
     tmg_timer_t *tb = (tmg_timer_t *) b;
 
     return -(ta->end - tb->end);
+}
+
+/// Resolve the socket path.
+///
+/// The order in which the values are used:
+/// 1. command line option
+/// 2. value of the environmental variable `TMG_SOCKET`
+/// 3. the default path is `$XDG_RUNTIME_DIR/tmg.socket`
+char *socket_path()
+{
+    size_t len;
+    char *ptr = NULL;
+    char *env_val = NULL;
+
+    if (arg_sock_path != NULL) {
+        ptr = strdup(arg_sock_path);
+    } else if ((env_val = getenv(DEFAULT_ENV_VAR)) != NULL) {
+        ptr = strdup(env_val);
+    } else {
+        env_val = getenv("XDG_RUNTIME_DIR");
+        if (env_val != NULL) {
+            len = strlen(env_val);
+            ptr = malloc(len + strlen(DEFAULT_SOCKET_PATH)); // |env_val| + |DEFAULT_SOCKET_PATH| + '/' + '\0'
+            if (ptr != NULL) {
+                sprintf(ptr, "%s/%s", env_val, DEFAULT_SOCKET_PATH);
+            }
+        }
+    }
+
+    return ptr;
 }
 
 /// Enqueue a timer onto the priority queue.
@@ -237,9 +264,7 @@ void *thread_routine(void *args)
     tmg_manager_t *mgr = (tmg_manager_t *) args;
     tmg_timer_t timer = { 0 };
     int res;
-    size_t msg_len, prog_len;
     time_t secs, curr_time;
-    char *cmdbuf;
     char *prog;
 
     // Should be able to be canceled at any time (when the cancellation is *ENABLED*).
@@ -248,7 +273,6 @@ void *thread_routine(void *args)
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     pthread_mutex_lock(&mgr->mutex); // SAFETY: it is okay to wait for mutex lock, because the thread should always be canceled before creating a new one.
     curr_time = time(NULL);
-    prog = strdup(mgr->program);
     memcpy(&timer, &mgr->q.timers[mgr->q.len - 1], sizeof(tmg_timer_t));
     LOG("%s: new thread for timer with id '%d' created\n", TRACE, timer.id);
     secs = timer.end - curr_time;
@@ -267,23 +291,11 @@ void *thread_routine(void *args)
         LOG("%s: timer id: %d is delayed by %ld seconds\n", WARN, timer.id, -secs);
     }
 
-    msg_len = strlen(timer.arg);
-    prog_len = strlen(prog);
-    // Disable cancellation for allocation and cleaning in order to prevent memory leaks.
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-    cmdbuf = malloc(msg_len + prog_len + 2);
-    pthread_cleanup_push((void (*)(void *)) free, cmdbuf);
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-
-    sprintf(cmdbuf, "%s %s", prog, timer.arg);
-
-    res = system(cmdbuf);
+    res = system(timer.arg);
     if (res != 0) {
         perror("tmg");
     }
 
-    // Do the actual cleanup, free both allocated strings, we won't need them anymore.
-    pthread_cleanup_pop(true);
     pthread_cleanup_pop(true);
 
     // Disable cancellation and try to schedule the next thread.
@@ -326,8 +338,7 @@ int init_manager(tmg_manager_t *mgr)
     pthread_mutexattr_t attrs;
 
     mgr->current = 0;
-    mgr->program = arg_prog != NULL ? strdup(arg_prog) : strdup(DEFAULT_PROGRAM);
-    mgr->sock_path = arg_sock_path != NULL ? strdup(arg_sock_path) : strdup(DEFAULT_SOCKET_PATH);
+    mgr->sock_path = socket_path();
     mgr->sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
 
     mgr->q.len = 0;
@@ -337,8 +348,8 @@ int init_manager(tmg_manager_t *mgr)
     pthread_mutexattr_init(&attrs);
     pthread_mutexattr_settype(&attrs, PTHREAD_MUTEX_RECURSIVE);
     res = pthread_mutex_init(&mgr->mutex, &attrs);
-    if (mgr->program == NULL || mgr->sock_path == NULL || mgr->sockfd == -1 || mgr->q.timers == NULL) {
-        perror("tmg");
+    if (mgr->sock_path == NULL || mgr->sockfd == -1 || mgr->q.timers == NULL) {
+        perror("resources");
         goto init_manager_err;
     }
 
@@ -356,7 +367,6 @@ int init_manager(tmg_manager_t *mgr)
     return 0;
 
 init_manager_err:
-    free(mgr->program);
     free(mgr->sock_path);
     free(mgr->q.timers);
     close(mgr->sockfd);
@@ -370,7 +380,6 @@ void free_manager(tmg_manager_t *mgr)
     close(mgr->sockfd);
     (void) unlink(mgr->sock_path);
     free(mgr->sock_path);
-    free(mgr->program);
     free(mgr->q.timers);
     pthread_mutex_destroy(&mgr->mutex);
 }
@@ -557,7 +566,12 @@ int client_main()
         return -1;
     }
 
-    sock_path = arg_sock_path != NULL ? strdup(arg_sock_path) : strdup(DEFAULT_SOCKET_PATH);
+    sock_path = socket_path();
+    if (sock_path == NULL) {
+        perror("socket path");
+        return -1;
+    }
+
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
@@ -573,7 +587,7 @@ int client_main()
     msg.minutes = arg_mins;
     msg.secs = arg_secs;
     // So that we do not overflow the buffer
-    strncpy(msg.arg, arg_msg != NULL ? arg_msg : "", MAXSIZE - 1);
+    strncpy(msg.arg, arg_run != NULL ? arg_run : "", MAXSIZE - 1);
 
     if (arg_change) {
         msg.op = OP_CHANGE;
@@ -667,7 +681,7 @@ int main(int argc, char *argv[])
 {
     int o, res;
 
-    while ((o = getopt(argc, argv, "hDm:M:s:H:S:p:ld:c:b:q")) != -1) {
+    while ((o = getopt(argc, argv, "hDm:R:s:H:S:ld:c:b:q")) != -1) {
         switch (o) {
         case 'D':
             arg_daemon = true;
@@ -693,14 +707,11 @@ int main(int argc, char *argv[])
         case 'b':
             arg_backlog = atoi(optarg);
             break;
-        case 'M':
-            arg_msg = strdup(optarg);
+        case 'R':
+            arg_run = strdup(optarg);
             break;
         case 'S':
             arg_sock_path = strdup(optarg);
-            break;
-        case 'p':
-            arg_prog = strdup(optarg);
             break;
         case 'q':
             arg_quit = true;
@@ -719,9 +730,8 @@ int main(int argc, char *argv[])
     }
 
 cleanup:
-    free(arg_prog);
     free(arg_sock_path);
-    free(arg_msg);
+    free(arg_run);
 
     return res;
 }
