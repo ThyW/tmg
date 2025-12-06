@@ -517,24 +517,53 @@ int list_timers(tmg_manager_t *mgr, const tmg_client_message_t *msg, int conn)
     int res;
     tmg_timer_t timer;
     struct tm *lt;
+    char *table_buf;
     char begin_buf[64];
     char end_buf[64];
-    LOG("%s: listing timers\n", INFO)
+    size_t maxsize, currsize, maxarg, currarg;
+    LOG("%s: listing timers\n", INFO);
+    maxsize = 105;
+    maxarg = 31;
 
     UNRECOVERABLE(res, "unrecoverable: could not acquire mutex", pthread_mutex_lock(&mgr->mutex));
+    for (size_t i = 0; i < mgr->q.len; i++) {
+        currsize = 0;
+        timer = mgr->q.timers[(mgr->q.len - 1) - i];
+        lt = localtime(&timer.begin);
+        strftime(begin_buf, sizeof(begin_buf), "%a %b %e %H:%M:%S %Y", lt);
+        lt = localtime(&timer.end);
+        strftime(end_buf, sizeof(end_buf), "%a %b %e %H:%M:%S %Y", lt);
+        currarg = strlen(timer.arg);
+        currsize = snprintf(NULL, 0, "| %-10d | %-25s | %-25s | %-*s |\n", timer.id, begin_buf, end_buf, (int) currarg, timer.arg);
+        maxsize = (currsize > maxsize ? currsize : maxsize);
+        maxarg = (currarg > maxarg ? currarg : maxarg);
+    }
+
+    table_buf = calloc(maxsize, 1);
+    if (table_buf == NULL) {
+        UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
+        return 1;
+    }
+    table_buf[0] = '+';
+    for (size_t i = 1; i < maxsize - 2; i++) {
+        table_buf[i] = '-';
+    }
+    table_buf[maxsize - 2] = '+';
+    table_buf[maxsize - 1] = '\n';
+
     REPLY(conn, "%s listing timers:\n", OK);
-    REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
-    REPLY(conn, "| %10s | %25s | %25s | %30s |\n", "ID", "BEGIN TIME", "END TIME", "ARGUMENT");
+    REPLY(conn, "%s", table_buf);
+    REPLY(conn, "| %-10s | %-25s | %-25s | %-*s |\n", "ID", "BEGIN TIME", "END TIME", (int) maxarg, "ARGUMENT");
     for (size_t i = 0; i < mgr->q.len; i++) {
         timer = mgr->q.timers[(mgr->q.len - 1) - i];
         lt = localtime(&timer.begin);
         strftime(begin_buf, sizeof(begin_buf), "%a %b %e %H:%M:%S %Y", lt);
         lt = localtime(&timer.end);
         strftime(end_buf, sizeof(end_buf), "%a %b %e %H:%M:%S %Y", lt);
-        REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
-        REPLY(conn, "| %10d | %25s | %25s | %30s |\n", timer.id, begin_buf, end_buf, timer.arg);
+        REPLY(conn, "%s", table_buf);
+        REPLY(conn, "| %-10d | %-25s | %-25s | %-*s |\n", timer.id, begin_buf, end_buf, (int) maxarg, timer.arg);
     }
-    REPLY(conn, "+-----------------------------------------------------------------------------------------------------+\n");
+    REPLY(conn, "%s", table_buf);
     UNRECOVERABLE(res, "unrecoverable: someome stole my mutex!", pthread_mutex_unlock(&mgr->mutex));
     return 0;
 }
